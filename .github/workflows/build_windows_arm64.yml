@@ -2,85 +2,266 @@ name: Build Windows ARM64
 
 on:
   workflow_dispatch:
+    inputs:
+      test_mode:
+        description: "Test mode (skip release upload)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 env:
-  # Use Flutter main branch for better ARM64 support
-  FLUTTER_VERSION: "3.41.2"
-  FLUTTER_CHANNEL: "main"
+  # Flutter stable 目前不支持 Windows ARM64，必须使用 main 分支
+  # 此 commit hash 来自 Gopeed 项目已验证可用的版本
+  FLUTTER_VERSION_WIN_ARM64: "7e1c8868"
+  FLUTTER_CHANNEL_WIN_ARM64: "main"
+  RUST_VERSION: "1.84.1"
+  # LLVM MinGW 版本，用于提供 ARM64 原生工具链
+  LLVM_MINGW_VERSION: "20251202"
+
+permissions:
+  contents: write
 
 jobs:
-  build_windows_zip_arm64:
+  # ============================================
+  # Job 1: 获取版本号
+  # ============================================
+  get_version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from pubspec.yaml
+        id: get_version
+        run: |
+          VERSION=$(sed -n 's/^version: \([0-9]*\.[0-9]*\.[0-9]*\).*/\1/p' app/pubspec.yaml)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "📦 Version: $VERSION"
+
+  # ============================================
+  # Job 2: 在 Windows ARM64 runner 上编译
+  # ============================================
+  build_windows_arm64:
+    needs: get_version
     runs-on: windows-11-arm
 
     steps:
-      - name: Fix long file paths
-        run: git config --system core.longpaths true
+      # ------------------------------------------
+      # 1. 基础准备
+      # ------------------------------------------
+      - name: Enable long file paths
+        run: |
+          git config --system core.longpaths true
+          git config --global core.longpaths true
 
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
-      # Install LLVM mingw for ARM64
+      # ------------------------------------------
+      # 2. 安装 LLVM MinGW 工具链 (ARM64 原生)
+      #    Rust 编译原生依赖（如 localsend 的 Rust FFI 部分）时
+      #    在 Windows ARM64 上可能需要此工具链提供链接器支持
+      # ------------------------------------------
       - name: Install llvm-mingw-ucrt-aarch64
         run: |
-          $ver = "20251202"
+          $ver = "${{ env.LLVM_MINGW_VERSION }}"
           $url = "https://github.com/mstorsjo/llvm-mingw/releases/download/$ver/llvm-mingw-$ver-ucrt-aarch64.zip"
           $zip = "$env:RUNNER_TEMP\llvm.zip"
           $extract = "$env:RUNNER_TEMP\extract"
           $target = "C:\clangarm64"
 
+          Write-Host "📥 Downloading LLVM MinGW from: $url"
           curl -L $url -o $zip
-          Remove-Item -Path $extract,$target -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -Path $extract -ItemType Directory
 
+          # 清理旧文件
+          Remove-Item -Recurse -Force $extract, $target -ErrorAction Ignore
+          New-Item -ItemType Directory -Path $extract | Out-Null
+
+          # 解压
+          Write-Host "📦 Extracting LLVM MinGW..."
           tar -xf $zip -C $extract
-          $extractedDir = Get-ChildItem -Path $extract | Select-Object -First 1
-          Move-Item -Path $extractedDir.FullName -Destination $target
+          Move-Item (Get-ChildItem $extract)[0].FullName $target
 
-          $b = "$target\bin"
-          "CC=$b\clang.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "CXX=$b\clang++.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "CLANGARM64_ROOT=$target" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          $env:PATH = "$b;$env:PATH"
+          # 设置环境变量
+          $bin = "$target\bin"
+          "$bin" >> $env:GITHUB_PATH
+          "CLANGARM64_ROOT=$target" >> $env:GITHUB_ENV
+          "CLANGARM64_BIN=$bin" >> $env:GITHUB_ENV
 
-      - uses: subosito/flutter-action@v2
+          Write-Host "✅ LLVM MinGW installed to: $target"
+
+      # ------------------------------------------
+      # 3. 安装 Flutter (main 分支)
+      #    Flutter stable 频道尚未正式支持 Windows ARM64
+      #    参考 Gopeed 项目使用 main 分支特定 commit
+      # ------------------------------------------
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: ${{ env.FLUTTER_CHANNEL }}
+          channel: ${{ env.FLUTTER_CHANNEL_WIN_ARM64 }}
+          flutter-version: ${{ env.FLUTTER_VERSION_WIN_ARM64 }}
 
-      - name: Dependencies
+      - name: Verify Flutter installation
+        run: |
+          flutter --version
+          flutter doctor -v
+          dart --version
+
+      # ------------------------------------------
+      # 4. 安装 Rust (带 ARM64 MSVC target)
+      # ------------------------------------------
+      - name: Install Rust
+        run: |
+          rustup install ${{ env.RUST_VERSION }}
+          rustup default ${{ env.RUST_VERSION }}
+          rustup target add aarch64-pc-windows-msvc
+          Write-Host "✅ Rust installed with aarch64-pc-windows-msvc target"
+
+      - name: Verify Rust installation
+        working-directory: app
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      # ------------------------------------------
+      # 5. 获取 Flutter 依赖
+      # ------------------------------------------
+      - name: Get Flutter dependencies
         working-directory: app
         run: flutter pub get
 
-      - name: Compile for Windows (ARM64)
-        working-directory: app
-        run: flutter build windows
-
-      - name: Create empty settings.json
-        working-directory: app
-        run: echo {} > build/windows/arm64/runner/Release/settings.json
-
-      - name: Add DLL files for ARM64
+      # ------------------------------------------
+      # 6. 编译 Windows ARM64
+      # ------------------------------------------
+      - name: Build Windows ARM64
         working-directory: app
         run: |
-          $mingw = "$env:CLANGARM64_ROOT\aarch64-w64-mingw32\bin"
-          $release = "build\windows\arm64\runner\Release"
-          $system = "C:\Windows\System32"
+          Write-Host "🔨 Building LocalSend for Windows ARM64..."
+          flutter build windows --release
+          Write-Host "✅ Build completed!"
 
-          # Copy mingw DLLs (only what's needed for ARM64)
-          Copy-Item "$mingw\libc++.dll" $release
-          Copy-Item "$mingw\libunwind.dll" $release
-
-          # Copy system DLLs
-          Copy-Item "$system\msvcp140.dll" $release
-          Copy-Item "$system\vcruntime140.dll" $release
-          Copy-Item "$system\vcruntime140_1.dll" $release
-
-      - name: Zip compiled files
+      # ------------------------------------------
+      # 7. 后处理：添加必要的运行时文件
+      # ------------------------------------------
+      - name: Post-build: Add runtime files
         working-directory: app
-        run: Compress-Archive -Path build/windows/arm64/runner/Release/* -DestinationPath LocalSend.zip
+        run: |
+          $release = "build\windows\arm64\runner\Release"
 
-      - name: Upload zip
-        uses: actions/upload-artifact@v6
+          # 验证构建产物存在
+          if (-not (Test-Path $release)) {
+            Write-Host "❌ Build output not found at: $release"
+            Write-Host "Searching for build output..."
+            Get-ChildItem -Path "build\windows" -Recurse -Directory | ForEach-Object { Write-Host $_.FullName }
+            exit 1
+          }
+
+          Write-Host "📁 Build output found at: $release"
+          Write-Host "📋 Contents:"
+          Get-ChildItem $release | ForEach-Object { Write-Host "  $_" }
+
+          # 创建空的 settings.json（LocalSend 便携模式需要）
+          echo {} > "$release\settings.json"
+          Write-Host "✅ Created settings.json"
+
+          # 复制 VC Runtime DLLs
+          # 在 ARM64 runner 上，System32 中的 DLL 就是 ARM64 原生版本
+          $system = "C:\Windows\System32"
+          $dlls = @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+
+          foreach ($dll in $dlls) {
+            $src = "$system\$dll"
+            if (Test-Path $src) {
+              Copy-Item $src "$release\"
+              Write-Host "✅ Copied: $dll"
+            } else {
+              Write-Host "⚠️ Warning: $dll not found in System32"
+            }
+          }
+
+          # 检查是否需要 LLVM MinGW 的运行时 DLL
+          $mingwBin = "$env:CLANGARM64_ROOT\aarch64-w64-mingw32\bin"
+          $mingwDlls = @("libwinpthread-1.dll", "libc++.dll", "libunwind.dll")
+
+          foreach ($dll in $mingwDlls) {
+            $src = "$mingwBin\$dll"
+            if (Test-Path $src) {
+              Copy-Item $src "$release\"
+              Write-Host "✅ Copied MinGW DLL: $dll"
+            }
+          }
+
+          Write-Host ""
+          Write-Host "📋 Final release contents:"
+          Get-ChildItem $release | ForEach-Object { Write-Host "  $($_.Name) ($([math]::Round($_.Length/1KB, 1)) KB)" }
+
+      # ------------------------------------------
+      # 8. 打包为 ZIP
+      # ------------------------------------------
+      - name: Create ZIP archive
+        working-directory: app
+        env:
+          VERSION: ${{ needs.get_version.outputs.version }}
+        run: |
+          $release = "build\windows\arm64\runner\Release"
+          $zipName = "LocalSend-${env:VERSION}-windows-arm64.zip"
+
+          Compress-Archive -Path "$release\*" -DestinationPath $zipName
+          Write-Host "📦 Created: $zipName"
+          Write-Host "📏 Size: $([math]::Round((Get-Item $zipName).Length/1MB, 2)) MB"
+
+      # ------------------------------------------
+      # 9. 上传构建产物 (Artifact)
+      # ------------------------------------------
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: LocalSend-windows-arm64
-          path: app/LocalSend.zip
+          name: LocalSend-${{ needs.get_version.outputs.version }}-windows-arm64
+          path: app/LocalSend-${{ needs.get_version.outputs.version }}-windows-arm64.zip
+          retention-days: 30
+
+      # ------------------------------------------
+      # 10. (可选) 上传到 Release
+      # ------------------------------------------
+      - name: Upload to Release
+        if: ${{ github.event.inputs.test_mode == 'false' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.get_version.outputs.version }}
+          draft: true
+          files: app/LocalSend-${{ needs.get_version.outputs.version }}-windows-arm64.zip
+          fail_on_unmatched_files: true
+
+  # ============================================
+  # Job 3: 构建摘要
+  # ============================================
+  summary:
+    needs: [get_version, build_windows_arm64]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Build Summary
+        run: |
+          echo "## 🏗️ Windows ARM64 Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Version** | ${{ needs.get_version.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Flutter** | main @ ${{ env.FLUTTER_VERSION_WIN_ARM64 }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Rust** | ${{ env.RUST_VERSION }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **LLVM MinGW** | ${{ env.LLVM_MINGW_VERSION }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Runner** | windows-11-arm |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Build Status** | ${{ needs.build_windows_arm64.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Test Mode** | ${{ github.event.inputs.test_mode }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📝 Notes" >> $GITHUB_STEP_SUMMARY
+          echo "- Flutter stable does not yet support Windows ARM64, using main branch" >> $GITHUB_STEP_SUMMARY
+          echo "- LLVM MinGW provides native ARM64 toolchain for Rust FFI compilation" >> $GITHUB_STEP_SUMMARY
+          echo "- VC Runtime DLLs are copied from the ARM64 runner's System32" >> $GITHUB_STEP_SUMMARY
