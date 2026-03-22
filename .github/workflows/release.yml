@@ -421,9 +421,9 @@ jobs:
         working-directory: app
         run: flutter pub get
 
-      - name: Compile for Windows ARM64
+      - name: Compile for Windows (ARM64)
         working-directory: app
-        run: flutter build windows --target-platform=windows-arm64
+        run: flutter build windows
 
       - name: Create empty settings.json
         working-directory: app
@@ -439,7 +439,6 @@ jobs:
           # Copy mingw DLLs
           Copy-Item "$mingw\libc++.dll" $release
           Copy-Item "$mingw\libunwind.dll" $release
-          Copy-Item "$mingw\libwinpthread-1.dll" $release
 
           # Copy system DLLs
           Copy-Item "$system\msvcp140.dll" $release
