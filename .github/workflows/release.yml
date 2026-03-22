@@ -120,14 +120,40 @@ jobs:
           cargo --version
 
       # ------------------------------------------
-      # 5. 获取 Flutter 依赖
+      # 5. 修复依赖冲突 + 获取依赖
       # ------------------------------------------
+      - name: Fix dependency conflicts for Flutter main branch
+        working-directory: app
+        shell: pwsh
+        run: |
+          $content = Get-Content -Path "pubspec.yaml" -Raw
+
+          # 如果已经有 dependency_overrides，先跳过
+          if ($content -match "dependency_overrides:") {
+            Write-Host "dependency_overrides already exists, skipping..."
+            return
+          }
+
+          # 追加 dependency_overrides 来解决 SDK pin 冲突
+          $overrides = @"
+
+          dependency_overrides:
+            matcher: any
+            test_api: any
+          "@
+
+          Add-Content -Path "pubspec.yaml" -Value $overrides
+          Write-Host "Added dependency_overrides to pubspec.yaml"
+          Write-Host ""
+          Write-Host "Last 10 lines of pubspec.yaml:"
+          Get-Content "pubspec.yaml" | Select-Object -Last 10
+
       - name: Get Flutter dependencies
         working-directory: app
         run: flutter pub get
 
       # ------------------------------------------
-      # 6. 生成代码（如果项目使用 build_runner）
+      # 6. 生成代码
       # ------------------------------------------
       - name: Generate code
         working-directory: app
@@ -168,6 +194,8 @@ jobs:
 
           if (-not $release) {
             Write-Host "Build output not found in expected paths. Searching..."
+            Write-Host ""
+            Write-Host "Directory tree under build\windows:"
             Get-ChildItem -Path "build\windows" -Recurse -Directory | ForEach-Object { Write-Host $_.FullName }
 
             $exeFile = Get-ChildItem -Path "build\windows" -Recurse -Filter "localsend*.exe" | Select-Object -First 1
@@ -188,7 +216,9 @@ jobs:
 
           Write-Host ""
           Write-Host "Build output contents:"
-          Get-ChildItem $release | ForEach-Object { Write-Host "  $($_.Name)" }
+          Get-ChildItem $release | ForEach-Object {
+            Write-Host "  $($_.Name) ($([math]::Round($_.Length/1KB, 1)) KB)"
+          }
 
       # ------------------------------------------
       # 9. 后处理：添加运行时文件
@@ -254,9 +284,6 @@ jobs:
           Write-Host "Created: $zipName"
           Write-Host "Size: $([math]::Round((Get-Item $zipName).Length/1MB, 2)) MB"
 
-          # 保存 zip 文件名供后续使用
-          "ZIP_FILE_NAME=$zipName" >> $env:GITHUB_ENV
-
       # ------------------------------------------
       # 11. 上传构建产物 (Artifact)
       # ------------------------------------------
@@ -303,12 +330,12 @@ jobs:
           echo "| **Test Mode** | ${{ inputs.test_mode }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ "${{ needs.build_windows_arm64.result }}" = "success" ]; then
-            echo "### Result: Build Successful" >> $GITHUB_STEP_SUMMARY
+            echo "### ✅ Build Successful" >> $GITHUB_STEP_SUMMARY
           else
-            echo "### Result: Build Failed" >> $GITHUB_STEP_SUMMARY
+            echo "### ❌ Build Failed" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**Troubleshooting tips:**" >> $GITHUB_STEP_SUMMARY
-            echo "- Check if Flutter main branch is compatible with project dependencies" >> $GITHUB_STEP_SUMMARY
+            echo "- Check dependency conflicts with Flutter main branch" >> $GITHUB_STEP_SUMMARY
             echo "- Verify Rust FFI compilation on ARM64" >> $GITHUB_STEP_SUMMARY
             echo "- Check build output path in the logs" >> $GITHUB_STEP_SUMMARY
           fi
