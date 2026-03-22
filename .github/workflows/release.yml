@@ -5,6 +5,8 @@ on:
 
 env:
   FLUTTER_VERSION: "3.35.6"
+  FLUTTER_VERSION_WIN_ARM64: "7e1c8868"
+  FLUTTER_CHANNEL_WIN_ARM64: "main"
   RUST_VERSION: "1.84.1"
   APK_BUILD_DIR: "/tmp/build"
 
@@ -20,7 +22,7 @@ jobs:
       - name: Get version from pubspec.yaml
         id: get_version
         run: |
-          VERSION=$(sed -n 's/^version: \([0-9]*\.[0-9]*\.[0-9]*\).*/\1/p' app/pubspec.yaml)
+          VERSION=$(sed -n 's/^version: $[0-9]*\.[0-9]*\.[0-9]*$.*/\1/p' app/pubspec.yaml)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
   build_apk:
@@ -135,8 +137,6 @@ jobs:
           name: tar-gz-x86-64-result
           path: ./app/*.tar.gz
 
-  # Manage the Flutter version on the self-hosted runner manually!
-  # Flutter currently doesn't provide Linux ARM64 binaries.
   build_tar_arm_64:
     needs: build
     runs-on: [ self-hosted, linux, arm64 ]
@@ -226,8 +226,6 @@ jobs:
           name: deb-x86-64-result
           path: ${{ steps.find_deb.outputs.deb_path }}
 
-  # Manage the Flutter version on the self-hosted runner manually!
-  # Flutter currently doesn't provide Linux ARM64 binaries.
   build_deb_arm_64:
     needs: build
     runs-on: [ self-hosted, linux, arm64 ]
@@ -376,18 +374,24 @@ jobs:
           name: windows-zip-x86-64-result
           path: app/LocalSend.zip
 
+  # ============================================
+  # 新增: Windows ARM64 构建
+  # ============================================
   build_windows_zip_arm64:
     needs: build
     runs-on: windows-11-arm
 
     steps:
       - name: Fix long file paths
-        run: git config --system core.longpaths true
+        run: |
+          git config --system core.longpaths true
+          git config --global core.longpaths true
 
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      # Install LLVM mingw for ARM64
+      # 安装 LLVM MinGW 工具链 (ARM64 原生)
+      # Rust 的某些 native 依赖在 Windows ARM64 上编译时可能需要此工具链
       - name: Install llvm-mingw-ucrt-aarch64
         run: |
           $ver = "20251202"
@@ -397,63 +401,69 @@ jobs:
           $target = "C:\clangarm64"
 
           curl -L $url -o $zip
-          Remove-Item -Path $extract,$target -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -Path $extract -ItemType Directory
+          Remove-Item -Recurse -Force $extract, $target -ErrorAction Ignore
+          New-Item -ItemType Directory -Path $extract | Out-Null
 
           tar -xf $zip -C $extract
-          $extractedDir = Get-ChildItem -Path $extract | Select-Object -First 1
-          Move-Item -Path $extractedDir.FullName -Destination $target
+          Move-Item (Get-ChildItem $extract)[0].FullName $target
 
-          $b = "$target\bin"
-          "CC=$b\clang.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "CXX=$b\clang++.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "CLANGARM64_BIN=$b" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "CGO_ENABLED=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "CLANGARM64_ROOT=$target" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          $env:PATH = "$b;$env:PATH"
+          $bin = "$target\bin"
+          "$bin" >> $env:GITHUB_PATH
+          "CLANGARM64_ROOT=$target" >> $env:GITHUB_ENV
+          "CLANGARM64_BIN=$bin" >> $env:GITHUB_ENV
 
+      # Flutter: 必须使用 main channel，因为 stable 尚不支持 Windows ARM64 构建
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: "stable"
+          channel: ${{ env.FLUTTER_CHANNEL_WIN_ARM64 }}
+          flutter-version: ${{ env.FLUTTER_VERSION_WIN_ARM64 }}
+
+      # 安装 Rust（windows-11-arm runner 上需要 aarch64-pc-windows-msvc target）
+      - name: Install Rust
+        run: |
+          rustup install ${{ env.RUST_VERSION }}
+          rustup default ${{ env.RUST_VERSION }}
+          rustup target add aarch64-pc-windows-msvc
+          rustup show
+
+      - name: Check rust-toolchain.toml
+        working-directory: app
+        run: rustup show
 
       - name: Dependencies
         working-directory: app
         run: flutter pub get
 
-      - name: Compile for Windows (ARM64)
+      - name: Compile for Windows ARM64
         working-directory: app
         run: flutter build windows
 
       - name: Create empty settings.json
         working-directory: app
-        run: echo {} > build/windows/arm64/runner/Release/settings.json
+        run: |
+          echo {} > build/windows/arm64/runner/Release/settings.json
 
-      - name: Add DLL files for ARM64
+      - name: Add runtime DLL files
         working-directory: app
         run: |
-          $mingw = "$env:CLANGARM64_ROOT\aarch64-w64-mingw32\bin"
           $release = "build\windows\arm64\runner\Release"
           $system = "C:\Windows\System32"
 
-          # Copy mingw DLLs
-          Copy-Item "$mingw\libc++.dll" $release
-          Copy-Item "$mingw\libunwind.dll" $release
-
-          # Copy system DLLs
-          Copy-Item "$system\msvcp140.dll" $release
-          Copy-Item "$system\vcruntime140.dll" $release
-          Copy-Item "$system\vcruntime140_1.dll" $release
+          # VC Runtime DLLs - 在 ARM64 runner 上系统目录里的就是 ARM64 原生版本
+          Copy-Item "$system\msvcp140.dll" "$release\"
+          Copy-Item "$system\vcruntime140.dll" "$release\"
+          Copy-Item "$system\vcruntime140_1.dll" "$release\"
 
       - name: Zip compiled files
         working-directory: app
-        run: Compress-Archive -Path build/windows/arm64/runner/Release/* -DestinationPath LocalSend.zip
+        run: |
+          Compress-Archive -Path build/windows/arm64/runner/Release/* -DestinationPath LocalSend-arm64.zip
 
       - name: Upload zip
         uses: actions/upload-artifact@v6
         with:
           name: windows-zip-arm64-result
-          path: app/LocalSend.zip
+          path: app/LocalSend-arm64.zip
 
   release:
     needs:
@@ -584,92 +594,4 @@ jobs:
           upload_url: ${{ steps.draft_release.outputs.upload_url }}
           asset_path: result.deb
           asset_name: LocalSend-${{ needs.build.outputs.version }}-linux-x86-64.deb
-          asset_content_type: application/vnd.debian.binary-package
-
-      # DEB (arm_64)
-      - name: Download deb file
-        uses: actions/download-artifact@v7
-        with:
-          name: deb-arm-64-result
-          path: deb-arm-64-result
-
-      - name: Copy deb file to root
-        run: cp deb-arm-64-result/*.deb result.deb
-
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.draft_release.outputs.upload_url }}
-          asset_path: result.deb
-          asset_name: LocalSend-${{ needs.build.outputs.version }}-linux-arm-64.deb
-          asset_content_type: application/vnd.debian.binary-package
-
-      # APPIMAGE (x86_64)
-      - name: Download AppImage file
-        uses: actions/download-artifact@v7
-        with:
-          name: appimage-x86-64-result
-          path: appimage-x86-64-result
-
-      - name: List files in appimage-directory
-        run: ls -l appimage-x86-64-result
-
-      - name: Copy AppImage file to root
-        run: |
-          for file in appimage-x86-64-result/*; do
-            if [[ $file == *.AppImage && $file != *.AppImage.zsync ]]; then
-              cp "$file" result.AppImage
-            fi
-          done
-
-      - name: Upload Release Asset (AppImage)
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.draft_release.outputs.upload_url }}
-          asset_path: result.AppImage
-          asset_name: LocalSend-${{ needs.build.outputs.version }}-linux-x86-64.AppImage
-          asset_content_type: application/x-appimage
-
-      # WINDOWS ZIP (x86_64)
-      - name: Download windows zip file
-        uses: actions/download-artifact@v7
-        with:
-          name: windows-zip-x86-64-result
-          path: windows-zip-x86-64-result
-
-      - name: Copy zip file to root
-        run: cp windows-zip-x86-64-result/*.zip result.zip
-
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.draft_release.outputs.upload_url }}
-          asset_path: result.zip
-          asset_name: LocalSend-${{ needs.build.outputs.version }}-windows-x86-64.zip
-          asset_content_type: application/zip
-
-      # WINDOWS ZIP (ARM64)
-      - name: Download windows zip file (ARM64)
-        uses: actions/download-artifact@v7
-        with:
-          name: windows-zip-arm64-result
-          path: windows-zip-arm64-result
-
-      - name: Copy zip file to root (ARM64)
-        run: cp windows-zip-arm64-result/*.zip result_arm64.zip
-
-      - name: Upload Release Asset (ARM64)
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.draft_release.outputs.upload_url }}
-          asset_path: result_arm64.zip
-          asset_name: LocalSend-${{ needs.build.outputs.version }}-windows-arm64.zip
-          asset_content_type: application/zip
+          asset_content_type: application/vnd
